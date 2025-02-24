@@ -1,0 +1,117 @@
+# Instalação das bibliotecas necessárias
+!pip install gymnasium stable-baselines3 yfinance
+
+# Importação das bibliotecas
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from stable_baselines3 import PPO
+
+# 1. Coletar Dados Históricos para Treinamento
+cryptos = ["BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "SOL-USD"]
+start_date = "2021-01-01"
+end_date = "2024-12-31"
+data = yf.download(cryptos, start=start_date, end=end_date)['Close']
+
+# 2. Definir a Classe do Ambiente CryptoPortfolioEnv com Recompensa Ajustada para Penalizar a Volatilidade
+class CryptoPortfolioEnv(gym.Env):
+    def __init__(self, data, initial_balance=1000000, volatility_penalty=0.25, transaction_cost=0.0005, min_allocation=-0.4, max_allocation=0.4, max_asset_weight=0.25):
+        super(CryptoPortfolioEnv, self).__init__()
+
+        self.data = data
+        self.num_assets = data.shape[1]
+        self.initial_balance = initial_balance
+        self.volatility_penalty = volatility_penalty
+        self.transaction_cost = transaction_cost
+
+        self.min_allocation = min_allocation
+        self.max_allocation = max_allocation
+        self.max_asset_weight = max_asset_weight
+
+        self.action_space = spaces.Box(low=self.min_allocation, high=self.max_allocation, shape=(self.num_assets,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(self.num_assets,), dtype=np.float32)
+
+        self.reset()
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 0
+        self.balance = self.initial_balance
+        self.weights = np.ones(self.num_assets) / self.num_assets
+        self.daily_returns = []
+        self.total_transaction_costs = 0
+        return self.data.iloc[self.current_step].values, {}
+
+    def step(self, action):
+        action = np.clip(action, self.min_allocation, self.max_allocation)
+
+        if self.current_step == 0:
+            self.weights = np.ones(self.num_assets) / self.num_assets
+        else:
+            if np.sum(action) == 0:
+                self.weights = np.ones(self.num_assets) / self.num_assets
+            else:
+                self.weights = action / np.sum(action)
+
+            self.weights = np.clip(self.weights, 0, self.max_asset_weight)
+            self.weights /= self.weights.sum()
+
+        current_prices = self.data.iloc[self.current_step].values
+        next_prices = self.data.iloc[self.current_step + 1].values
+        returns = (next_prices - current_prices) / current_prices
+        portfolio_return = np.dot(self.weights, returns)
+
+        transaction_volume = np.abs(self.weights - action).sum()
+        transaction_cost = self.transaction_cost * transaction_volume * self.balance
+        self.total_transaction_costs += transaction_cost
+
+        self.balance *= (1 + portfolio_return)
+        self.balance -= transaction_cost
+
+        self.daily_returns.append(portfolio_return)
+
+        mean_return = np.mean(self.daily_returns) if len(self.daily_returns) > 1 else portfolio_return
+        volatility = np.std(self.daily_returns) if len(self.daily_returns) > 1 else 0
+
+        reward = mean_return - self.volatility_penalty * volatility if volatility != 0 else mean_return
+
+        self.current_step += 1
+
+        done = self.current_step >= len(self.data) - 1
+        terminated = done
+        truncated = False
+
+        next_state = self.data.iloc[self.current_step].values
+
+        return next_state, reward, terminated, truncated, {}
+
+# Treinar o modelo com dados de 2021 até 2024
+env = CryptoPortfolioEnv(data, initial_balance=1000000, volatility_penalty=0.25, transaction_cost=0.0005, min_allocation=-0.4, max_allocation=0.4, max_asset_weight=0.25)
+model = PPO(
+    "MlpPolicy",
+    env,
+    verbose=1,
+    learning_rate=0.00005,
+    n_steps=4096
+)
+
+model.learn(total_timesteps=100000)
+print("Treinamento concluído.")
+
+# Período de Teste
+test_start_date = input("Digite a data de início do teste (YYYY-MM-DD): ")
+test_end_date = input("Digite a data de término do teste (YYYY-MM-DD): ")
+test_data = yf.download(cryptos, start=test_start_date, end=test_end_date)['Close']
+
+test_env = CryptoPortfolioEnv(test_data, initial_balance=1000000, transaction_cost=0.0005, min_allocation=-0.4, max_allocation=0.4, max_asset_weight=0.25)
+
+obs, _ = test_env.reset()
+
+for i in range(len(test_data) - 1):
+    action, _states = model.predict(obs)
+    obs, reward, done, _, _ = test_env.step(action)
+
+    if done:
+        break
